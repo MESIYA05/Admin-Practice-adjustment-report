@@ -188,42 +188,78 @@ async function initWidget() {
     showLoading('Loading claims data');
 
     try {
-        await ZOHO.CREATOR.UTIL.getQueryParams();
-
-        const doctorResp = await getRecords({
-            appName: "claims-management",
-            reportName: "All_Doctors"
-        });
-        const doctors = doctorResp.data || [];
-        populateDoctorDropdown(doctors);
-
+        let appName = "claims-management";
         try {
-            const hospResp = await getRecords({
-                appName: "claims-management",
-                reportName: "All_Hospitals"
-            });
-            populateHospitalDropdownDirect(hospResp.data || []);
+            const queryParams = await ZOHO.CREATOR.UTIL.getQueryParams();
+            if (queryParams && (queryParams.appName || queryParams.app_name)) {
+                appName = queryParams.appName || queryParams.app_name;
+            }
         } catch (e) {
-            // fallback: hospital dropdown will be built from claims data
+            await ZOHO.CREATOR.UTIL.getQueryParams();
         }
 
+        // 1. Fetch Practices from Add_Practice_Report (Practice_Name)
+        let practices = [];
         try {
-            const mapResp = await getRecords({
-                appName: "claims-management",
-                reportName: "All_Doctor_Hospital_Mappings1"
+            const practiceResp = await getRecords({
+                appName: appName,
+                reportName: "Add_Practice_Report"
             });
-            buildDoctorHospitalMap(mapResp.data || []);
+            practices = (practiceResp && practiceResp.data) || [];
         } catch (e) {
-            // mapping report not found — hospital dropdown shows all hospitals
+            console.warn('Could not load Add_Practice_Report:', e);
         }
+
+        // 2. Fetch Doctor & Hospital from Doctor_Hospital_Subform_Report
+        let subformRecs = [];
+        try {
+            const subformResp = await getRecords({
+                appName: appName,
+                reportName: "Doctor_Hospital_Subform_Report"
+            });
+            subformRecs = (subformResp && subformResp.data) || [];
+        } catch (e) {
+            console.warn('Could not load Doctor_Hospital_Subform_Report:', e);
+        }
+
+        // Fallbacks if subform has no records
+        let doctorsFallback = [];
+        let hospitalsFallback = [];
+        if (!subformRecs.length) {
+            try {
+                const doctorResp = await getRecords({
+                    appName: appName,
+                    reportName: "All_Doctors"
+                });
+                doctorsFallback = (doctorResp && doctorResp.data) || [];
+            } catch (e) {}
+
+            try {
+                const hospResp = await getRecords({
+                    appName: appName,
+                    reportName: "All_Hospitals"
+                });
+                hospitalsFallback = (hospResp && hospResp.data) || [];
+            } catch (e) {}
+
+            try {
+                const mapResp = await getRecords({
+                    appName: appName,
+                    reportName: "All_Doctor_Hospital_Mappings1"
+                });
+                buildDoctorHospitalMap((mapResp && mapResp.data) || []);
+            } catch (e) {}
+        }
+
+        buildPracticeDoctorHospitalMappings(practices, subformRecs, doctorsFallback, hospitalsFallback);
 
         let patientsLoaded = false;
         try {
             const patResp = await getRecords({
-                appName: "claims-management",
+                appName: appName,
                 reportName: "Add_Patient_Report"
             });
-            const pats = patResp.data || [];
+            const pats = (patResp && patResp.data) || [];
             if (pats.length) {
                 populatePatientDropdownDirect(pats);
                 patientsLoaded = true;
@@ -234,10 +270,10 @@ async function initWidget() {
 
         try {
             const itemsResp = await getRecords({
-                appName: "claims-management",
+                appName: appName,
                 reportName: "Add_Item_Report"
             });
-            const itemRecs = itemsResp.data || [];
+            const itemRecs = (itemsResp && itemsResp.data) || [];
             ITEM_ID_TO_NUMBER_MAP = new Map();
             itemRecs.forEach(item => {
                 const id = item.ID || item.id;
@@ -250,10 +286,10 @@ async function initWidget() {
         }
 
         const claimsResp = await getRecords({
-            appName: "claims-management",
+            appName: appName,
             reportName: "Add_Claim_Report"
         });
-        const claims = claimsResp.data || [];
+        const claims = (claimsResp && claimsResp.data) || [];
 
         if (ADJ_TYPES.length === 0) {
             const seen = new Map();
@@ -278,8 +314,13 @@ async function initWidget() {
         allData = allRows.filter(r => r.type && r.type !== '—');
         filtered = [...allData];
 
+        if (ALL_DOCTOR_ITEMS.length === 0) {
+            populateDoctorDropdownFromClaims(allRows);
+        }
         const ssList = document.querySelectorAll('#ss-location .ss-list .ss-option');
-        if (ssList.length <= 1) populateHospitalDropdown(allRows);
+        if (ALL_HOSPITAL_ITEMS.length === 0 || ssList.length <= 1) {
+            populateHospitalDropdown(allRows);
+        }
 
         populateStaffDropdown(allRows);
         if (!patientsLoaded) populatePatientDropdownFromClaims(allData);
@@ -296,8 +337,264 @@ async function initWidget() {
 
 
 /* ─────────────────────────────────────────────────────────────────────
-   DROPDOWN HELPERS
+   DROPDOWN HELPERS & MAPPING BUILDER
    ───────────────────────────────────────────────────────────────────── */
+function buildPracticeDoctorHospitalMappings(practices, subformRecs, doctorsFallback = [], hospitalsFallback = []) {
+    PRACTICE_ID_TO_NAME = new Map();
+    PRACTICE_NAME_TO_ID = new Map();
+    DOCTOR_ID_TO_NAME = new Map();
+    DOCTOR_NAME_TO_ID = new Map();
+    HOSPITAL_ID_TO_NAME = new Map();
+    HOSPITAL_NAME_TO_ID = new Map();
+
+    PRACTICE_TO_DOCTORS = new Map();
+    PRACTICE_TO_HOSPITALS = new Map();
+    PRACTICE_DOC_TO_HOSPITALS = new Map();
+    DOCTOR_TO_HOSPITALS = new Map();
+    PRACTICE_DOC_HOSP_PAIRS = new Map();
+    ALL_SUBFORM_ROWS = [];
+
+    // 1. Process practices from Add_Practice_Report
+    (practices || []).forEach(p => {
+        const id = extractLookupId(p) || p.ID || p.id || '';
+        const name = p.Practice_Name || extractLookupName(p, ['Practice_Name', 'Name']) || p.zc_display_value || id;
+        if (id && name) {
+            const pIdStr = String(id).trim();
+            const pNameStr = String(name).replace(/\s+/g, ' ').trim();
+            PRACTICE_ID_TO_NAME.set(pIdStr, pNameStr);
+            PRACTICE_NAME_TO_ID.set(normName(pNameStr), pIdStr);
+        }
+    });
+
+    // Process fallback doctors & hospitals
+    (doctorsFallback || []).forEach(doc => {
+        const dId = doc.ID || doc.id || '';
+        const dName = doc.Doctor_Name || doc.Name || doc.Full_Name || doc.zc_display_value || dId;
+        if (dId && dName) {
+            DOCTOR_ID_TO_NAME.set(String(dId), String(dName).trim());
+            DOCTOR_NAME_TO_ID.set(normName(dName), String(dId));
+        }
+    });
+
+    (hospitalsFallback || []).forEach(hosp => {
+        const hId = hosp.ID || hosp.id || '';
+        const hName = hosp.Hospital_Name || hosp.Name || hosp.zc_display_value || hId;
+        if (hId && hName) {
+            HOSPITAL_ID_TO_NAME.set(String(hId), String(hName).trim());
+            HOSPITAL_NAME_TO_ID.set(normName(hName), String(hId));
+        }
+    });
+
+    // 2. Process subform records from Doctor_Hospital_Subform_Report
+    const docMap = new Map();
+    const hospMap = new Map();
+
+    (subformRecs || []).forEach(rec => {
+        // Doctor field from Doctor_Hospital_Subform_Report
+        const docVal = probe(rec, 'Doctor', ['Doctor_Name', 'Doctor_Details', 'Doctors']);
+        let docId = extractLookupId(docVal);
+        let docName = extractLookupName(docVal, ['Doctor_Name', 'Name', 'Doctor']);
+        if (!docName && docVal && typeof docVal === 'string' && !/^\d{10,}$/.test(docVal)) {
+            docName = docVal.trim();
+        }
+        if (!docId && docVal && /^\d{10,}$/.test(String(docVal))) {
+            docId = String(docVal);
+        }
+        if (!docName && docId && DOCTOR_ID_TO_NAME.has(String(docId))) {
+            docName = DOCTOR_ID_TO_NAME.get(String(docId));
+        }
+        if (!docId && docName && DOCTOR_NAME_TO_ID.has(normName(docName))) {
+            docId = DOCTOR_NAME_TO_ID.get(normName(docName));
+        }
+        if (!docId && docName) docId = docName;
+        if (!docName && docId) docName = docId;
+
+        if (docId && docName) {
+            DOCTOR_ID_TO_NAME.set(String(docId), docName);
+            DOCTOR_NAME_TO_ID.set(normName(docName), String(docId));
+            if (!docMap.has(String(docId))) {
+                docMap.set(String(docId), { value: String(docId), label: docName });
+            }
+        }
+
+        // Hospital field from Doctor_Hospital_Subform_Report
+        const hospVal = probe(rec, 'Hospital', ['Hospital_Name', 'Hospital_Details', 'Hospitals']);
+        let hospId = extractLookupId(hospVal);
+        let hospName = extractLookupName(hospVal, ['Hospital_Name', 'Name', 'Hospital']);
+        if (!hospName && hospVal && typeof hospVal === 'string' && !/^\d{10,}$/.test(hospVal)) {
+            hospName = hospVal.trim();
+        }
+        if (!hospId && hospVal && /^\d{10,}$/.test(String(hospVal))) {
+            hospId = String(hospVal);
+        }
+        if (!hospName && hospId && HOSPITAL_ID_TO_NAME.has(String(hospId))) {
+            hospName = HOSPITAL_ID_TO_NAME.get(String(hospId));
+        }
+        if (!hospId && hospName && HOSPITAL_NAME_TO_ID.has(normName(hospName))) {
+            hospId = HOSPITAL_NAME_TO_ID.get(normName(hospName));
+        }
+        if (!hospId && hospName) hospId = hospName;
+        if (!hospName && hospId) hospName = hospId;
+
+        if (hospId && hospName) {
+            HOSPITAL_ID_TO_NAME.set(String(hospId), hospName);
+            HOSPITAL_NAME_TO_ID.set(normName(hospName), String(hospId));
+            if (!hospMap.has(String(hospId))) {
+                hospMap.set(String(hospId), { value: String(hospId), label: hospName });
+            }
+        }
+
+        // Practice field from Doctor_Hospital_Subform_Report
+        const practiceVal = probe(rec, 'Add_Practice', ['Practice', 'Practice_Name', 'Practice_ID', 'Doctor_Hospital_Mapping']);
+        let pId = extractLookupId(practiceVal);
+        let pName = extractLookupName(practiceVal, ['Practice_Name', 'Name']);
+        if (!pId && practiceVal && /^\d{10,}$/.test(String(practiceVal))) {
+            pId = String(practiceVal);
+        }
+        if (pId && !pName && PRACTICE_ID_TO_NAME.has(String(pId))) {
+            pName = PRACTICE_ID_TO_NAME.get(String(pId));
+        }
+        if (pName && !pId && PRACTICE_NAME_TO_ID.has(normName(pName))) {
+            pId = PRACTICE_NAME_TO_ID.get(normName(pName));
+        }
+        if (!pId && pName) pId = pName;
+        if (!pName && pId) pName = pId;
+
+        if (pId && pName) {
+            if (!PRACTICE_ID_TO_NAME.has(String(pId))) PRACTICE_ID_TO_NAME.set(String(pId), pName);
+            if (!PRACTICE_NAME_TO_ID.has(normName(pName))) PRACTICE_NAME_TO_ID.set(normName(pName), String(pId));
+        }
+
+        const pKey = String(pId || '');
+        const pNameKey = normName(pName || '');
+        const dKey = String(docId || '');
+        const dNameKey = normName(docName || '');
+        const hKey = String(hospId || '');
+        const hNameKey = normName(hospName || '');
+
+        ALL_SUBFORM_ROWS.push({
+            practiceId: pKey,
+            practiceName: pName || '',
+            doctorId: dKey,
+            doctorName: docName || '',
+            hospitalId: hKey,
+            hospitalName: hospName || ''
+        });
+
+        // Add to mappings
+        if (pKey) {
+            // Practice -> Doctors
+            if (dKey && docName) {
+                if (!PRACTICE_TO_DOCTORS.has(pKey)) PRACTICE_TO_DOCTORS.set(pKey, new Map());
+                PRACTICE_TO_DOCTORS.get(pKey).set(dKey, { value: dKey, label: docName });
+
+                if (pNameKey) {
+                    if (!PRACTICE_TO_DOCTORS.has(pNameKey)) PRACTICE_TO_DOCTORS.set(pNameKey, new Map());
+                    PRACTICE_TO_DOCTORS.get(pNameKey).set(dKey, { value: dKey, label: docName });
+                }
+            }
+
+            // Practice -> Hospitals
+            if (hKey && hospName) {
+                if (!PRACTICE_TO_HOSPITALS.has(pKey)) PRACTICE_TO_HOSPITALS.set(pKey, new Map());
+                PRACTICE_TO_HOSPITALS.get(pKey).set(hKey, { value: hKey, label: hospName });
+
+                if (pNameKey) {
+                    if (!PRACTICE_TO_HOSPITALS.has(pNameKey)) PRACTICE_TO_HOSPITALS.set(pNameKey, new Map());
+                    PRACTICE_TO_HOSPITALS.get(pNameKey).set(hKey, { value: hKey, label: hospName });
+                }
+            }
+
+            // Practice + Doctor -> Hospitals
+            if (dKey && hKey && hospName) {
+                const pdKey = `${pKey}_${dKey}`;
+                if (!PRACTICE_DOC_TO_HOSPITALS.has(pdKey)) PRACTICE_DOC_TO_HOSPITALS.set(pdKey, new Map());
+                PRACTICE_DOC_TO_HOSPITALS.get(pdKey).set(hKey, { value: hKey, label: hospName });
+
+                if (dNameKey) {
+                    const pdNameKey = `${pKey}_${dNameKey}`;
+                    if (!PRACTICE_DOC_TO_HOSPITALS.has(pdNameKey)) PRACTICE_DOC_TO_HOSPITALS.set(pdNameKey, new Map());
+                    PRACTICE_DOC_TO_HOSPITALS.get(pdNameKey).set(hKey, { value: hKey, label: hospName });
+                }
+            }
+
+            // Practice Pairs for matching
+            if (!PRACTICE_DOC_HOSP_PAIRS.has(pKey)) PRACTICE_DOC_HOSP_PAIRS.set(pKey, new Set());
+            const pairSet = PRACTICE_DOC_HOSP_PAIRS.get(pKey);
+            if (dKey && hKey) pairSet.add(`${dKey}|${hKey}`);
+            if (dNameKey && hNameKey) pairSet.add(`${dNameKey}|${hNameKey}`);
+            if (dKey && hNameKey) pairSet.add(`${dKey}|${hNameKey}`);
+            if (dNameKey && hKey) pairSet.add(`${dNameKey}|${hKey}`);
+            if (dKey) pairSet.add(`doc:${dKey}`);
+            if (dNameKey) pairSet.add(`doc:${dNameKey}`);
+            if (hKey) pairSet.add(`hosp:${hKey}`);
+            if (hNameKey) pairSet.add(`hosp:${hNameKey}`);
+
+            if (pNameKey) {
+                if (!PRACTICE_DOC_HOSP_PAIRS.has(pNameKey)) PRACTICE_DOC_HOSP_PAIRS.set(pNameKey, pairSet);
+            }
+        }
+
+        // Doctor -> Hospitals
+        if (dKey && hKey && hospName) {
+            if (!DOCTOR_TO_HOSPITALS.has(dKey)) DOCTOR_TO_HOSPITALS.set(dKey, new Map());
+            DOCTOR_TO_HOSPITALS.get(dKey).set(hKey, { value: hKey, label: hospName });
+
+            if (dNameKey) {
+                if (!DOCTOR_TO_HOSPITALS.has(dNameKey)) DOCTOR_TO_HOSPITALS.set(dNameKey, new Map());
+                DOCTOR_TO_HOSPITALS.get(dNameKey).set(hKey, { value: hKey, label: hospName });
+            }
+
+            if (!DOCTOR_HOSPITAL_MAP.has(dKey)) DOCTOR_HOSPITAL_MAP.set(dKey, new Set());
+            DOCTOR_HOSPITAL_MAP.get(dKey).add(hKey);
+        }
+    });
+
+    if (docMap.size > 0) {
+        ALL_DOCTOR_ITEMS = Array.from(docMap.values()).sort((a, b) => a.label.localeCompare(b.label));
+    } else if (doctorsFallback.length > 0) {
+        ALL_DOCTOR_ITEMS = doctorsFallback.map(doc => ({
+            value: doc.ID || doc.id || '',
+            label: doc.Doctor_Name || doc.Name || doc.Full_Name || doc.zc_display_value || doc.ID || ''
+        })).filter(i => i.value);
+    }
+
+    if (hospMap.size > 0) {
+        ALL_HOSPITAL_ITEMS = Array.from(hospMap.values()).sort((a, b) => a.label.localeCompare(b.label));
+    } else if (hospitalsFallback.length > 0) {
+        ALL_HOSPITAL_ITEMS = hospitalsFallback.map(h => ({
+            value: h.ID || h.id || '',
+            label: h.Hospital_Name || h.Name || h.zc_display_value || h.ID || ''
+        })).filter(i => i.value);
+    }
+
+    ALL_PRACTICE_ITEMS = Array.from(PRACTICE_ID_TO_NAME.entries()).map(([id, name]) => ({
+        value: id,
+        label: name
+    })).sort((a, b) => a.label.localeCompare(b.label));
+
+    _isUpdatingDropdowns = true;
+    try {
+        populateSSDropdown('ss-practice', ALL_PRACTICE_ITEMS, 'All Practices');
+        populateSSDropdown('ss-doctor', ALL_DOCTOR_ITEMS, 'All Doctors');
+        populateSSDropdown('ss-location', ALL_HOSPITAL_ITEMS, 'All Locations');
+    } finally {
+        _isUpdatingDropdowns = false;
+    }
+}
+
+function populateDoctorDropdownFromClaims(rows) {
+    const seen = new Map();
+    rows.forEach(r => {
+        if (r.doctorId && r.doctor && !seen.has(r.doctorId))
+            seen.set(r.doctorId, r.doctor);
+    });
+    ALL_DOCTOR_ITEMS = [];
+    seen.forEach((name, id) => ALL_DOCTOR_ITEMS.push({ value: id, label: name }));
+    ALL_DOCTOR_ITEMS.sort((a, b) => a.label.localeCompare(b.label));
+    populateSSDropdown('ss-doctor', ALL_DOCTOR_ITEMS, 'All Doctors');
+}
+
 function populateDoctorDropdown(doctors) {
     const items = doctors.map(doc => ({
         value: doc.ID || doc.id || '',
@@ -408,8 +705,16 @@ const LINE_FIELDS = {
    ───────────────────────────────────────────────────────────────────── */
 function extractLookupId(val) {
     if (val == null) return '';
-    if (typeof val === 'object') return val.ID || val.id || '';
-    return /^\d{10,}$/.test(String(val)) ? String(val) : '';
+    if (typeof val === 'object') {
+        const id = val.ID || val.id;
+        if (id != null && String(id).trim() !== '') return String(id).trim();
+        if (val.zc_display_value && /^\d{10,}$/.test(String(val.zc_display_value).trim())) {
+            return String(val.zc_display_value).trim();
+        }
+        return '';
+    }
+    const s = String(val).trim();
+    return /^\d{10,}$/.test(s) ? s : '';
 }
 
 function extractLookupName(val, candidates = []) {
@@ -562,6 +867,24 @@ function renderGrandSummaryCard(data) {
 let allData = [];
 let DOCTOR_HOSPITAL_MAP = new Map();
 let ALL_HOSPITAL_ITEMS = [];
+let ALL_DOCTOR_ITEMS = [];
+let ALL_PRACTICE_ITEMS = [];
+let ALL_SUBFORM_ROWS = [];
+
+let PRACTICE_ID_TO_NAME = new Map();
+let PRACTICE_NAME_TO_ID = new Map();
+let DOCTOR_ID_TO_NAME = new Map();
+let DOCTOR_NAME_TO_ID = new Map();
+let HOSPITAL_ID_TO_NAME = new Map();
+let HOSPITAL_NAME_TO_ID = new Map();
+
+let PRACTICE_TO_DOCTORS = new Map();
+let PRACTICE_TO_HOSPITALS = new Map();
+let PRACTICE_DOC_TO_HOSPITALS = new Map();
+let DOCTOR_TO_HOSPITALS = new Map();
+let PRACTICE_DOC_HOSP_PAIRS = new Map();
+let _isUpdatingDropdowns = false;
+
 let PATIENT_ID_TO_NAME = new Map();
 let filtered = [];
 let currentPage = 1;
@@ -776,6 +1099,8 @@ function buildClaimsData(invoices) {
             ['Hospital_Name', 'Hospital_Details', 'Hospitals']);
         const doctorVal = probe(rec, CLAIM_FIELDS.doctorLookup,
             ['Doctor_Name', 'Doctor_Details', 'Doctors']);
+        const practiceVal = probe(rec, 'Practice',
+            ['Add_Practice', 'Practice_Name', 'Practice_ID', 'Practice_Details', 'practice']);
         const patientVal = probe(rec, 'Patient', ['Patient_Name', 'patient_name', 'PatientName', 'Name']);
         const typeRaw = probe(rec, CLAIM_FIELDS.adjustmentType,
             ['Adj_Type', 'AdjustmentType', 'Type', 'Adjustment_Types']);
@@ -797,13 +1122,30 @@ function buildClaimsData(invoices) {
             ? rawLines.map(buildLineRow)
             : [{ itemNumber: '—', originalAmount: 0, adjustmentAmount: 0, originalAmountRaw: '', adjustmentAmountRaw: '' }];
 
+        let docId = extractLookupId(doctorVal);
+        let docName = extractLookupName(doctorVal, ['Doctor_Name', 'Name', 'Doctor']);
+        if (!docName && docId && DOCTOR_ID_TO_NAME.has(docId)) docName = DOCTOR_ID_TO_NAME.get(docId);
+        if (!docId && docName && DOCTOR_NAME_TO_ID.has(normName(docName))) docId = DOCTOR_NAME_TO_ID.get(normName(docName));
+
+        let hospId = extractLookupId(hospitalVal);
+        let hospName = extractLookupName(hospitalVal, ['Hospital_Name', 'Name', 'Hospital']);
+        if (!hospName && hospId && HOSPITAL_ID_TO_NAME.has(hospId)) hospName = HOSPITAL_ID_TO_NAME.get(hospId);
+        if (!hospId && hospName && HOSPITAL_NAME_TO_ID.has(normName(hospName))) hospId = HOSPITAL_NAME_TO_ID.get(normName(hospName));
+
+        let pId = extractLookupId(practiceVal);
+        let pName = extractLookupName(practiceVal, ['Practice_Name', 'Name']);
+        if (!pName && pId && PRACTICE_ID_TO_NAME.has(pId)) pName = PRACTICE_ID_TO_NAME.get(pId);
+        if (!pId && pName && PRACTICE_NAME_TO_ID.has(normName(pName))) pId = PRACTICE_NAME_TO_ID.get(normName(pName));
+
         return {
             id: rec.ID || '',
             claimId: claimIdRaw || rec.ID || '',
-            hospitalId: extractLookupId(hospitalVal),
-            hospital: extractLookupName(hospitalVal, ['Hospital_Name', 'Name']),
-            doctorId: extractLookupId(doctorVal),
-            doctor: extractLookupName(doctorVal, ['Doctor_Name', 'Name']),
+            hospitalId: hospId,
+            hospital: hospName || '—',
+            doctorId: docId,
+            doctor: docName || '—',
+            practiceId: pId,
+            practiceName: pName,
             patientId: extractLookupId(patientVal),
             patientName: typeof patientVal === 'string'
                 ? (patientVal.trim() === '[object Object]' ? '' : patientVal)
@@ -835,6 +1177,7 @@ function buildAdjOptions() {
    FILTERS
    ───────────────────────────────────────────────────────────────────── */
 function applyFilters() {
+    const practiceEl = document.getElementById('f-practice');
     const hospEl = document.getElementById('f-location');
     const docEl = document.getElementById('f-doctor');
     const adjEl = document.getElementById('f-adj-type');
@@ -843,6 +1186,7 @@ function applyFilters() {
     const toEl = document.getElementById('filter-to');
     const patEl = document.getElementById('f-patient');
 
+    const practice = practiceEl ? practiceEl.value : '';
     const hosp = hospEl ? hospEl.value : '';
     const doc = docEl ? docEl.value : '';
     const pat = patEl ? patEl.value : '';
@@ -852,18 +1196,81 @@ function applyFilters() {
     const from = fromEl ? parseZohoDate(fromEl.value) || fromEl.value : '';
     const to = toEl ? parseZohoDate(toEl.value) || toEl.value : '';
 
+    const practiceName = practice ? (PRACTICE_ID_TO_NAME.get(practice) || '') : '';
+    const practicePairs = practice ? PRACTICE_DOC_HOSP_PAIRS.get(practice) : null;
+    const practiceDocMap = practice ? PRACTICE_TO_DOCTORS.get(practice) : null;
+    const practiceHospMap = practice ? PRACTICE_TO_HOSPITALS.get(practice) : null;
+
+    const docName = doc ? (DOCTOR_ID_TO_NAME.get(doc) || '') : '';
+    const hospName = hosp ? (HOSPITAL_ID_TO_NAME.get(hosp) || '') : '';
+
     filtered = allData.filter(r => {
-        if (hosp && r.hospitalId !== hosp) return false;
-        if (doc && r.doctorId !== doc) return false;
+        // 1. Practice filter
+        if (practice) {
+            let matchesPractice = false;
+            if (r.practiceId && (r.practiceId === practice || normName(r.practiceId) === normName(practiceName))) {
+                matchesPractice = true;
+            } else if (r.practiceName && (normName(r.practiceName) === normName(practiceName) || r.practiceName === practice)) {
+                matchesPractice = true;
+            } else if (practicePairs) {
+                const dId = r.doctorId || '';
+                const hId = r.hospitalId || '';
+                const dName = normName(r.doctor);
+                const hName = normName(r.hospital);
+
+                if (dId && hId && practicePairs.has(`${dId}|${hId}`)) {
+                    matchesPractice = true;
+                } else if (dName && hName && practicePairs.has(`${dName}|${hName}`)) {
+                    matchesPractice = true;
+                } else if (dId && hName && practicePairs.has(`${dId}|${hName}`)) {
+                    matchesPractice = true;
+                } else if (dName && hId && practicePairs.has(`${dName}|${hId}`)) {
+                    matchesPractice = true;
+                } else if (practiceDocMap && (practiceDocMap.has(dId) || (dName && Array.from(practiceDocMap.values()).some(di => normName(di.label) === dName)))
+                       && practiceHospMap && (practiceHospMap.has(hId) || (hName && Array.from(practiceHospMap.values()).some(hi => normName(hi.label) === hName)))) {
+                    matchesPractice = true;
+                } else if ((!hId || r.hospital === '—') && practiceDocMap && (practiceDocMap.has(dId) || (dName && Array.from(practiceDocMap.values()).some(di => normName(di.label) === dName)))) {
+                    matchesPractice = true;
+                } else if ((!dId || r.doctor === '—') && practiceHospMap && (practiceHospMap.has(hId) || (hName && Array.from(practiceHospMap.values()).some(hi => normName(hi.label) === hName)))) {
+                    matchesPractice = true;
+                }
+            }
+            if (!matchesPractice) return false;
+        }
+
+        // 2. Doctor filter
+        if (doc) {
+            const idMatch = r.doctorId && r.doctorId === doc;
+            const nameMatch = (r.doctor && docName && normName(r.doctor) === normName(docName)) ||
+                              (r.doctor && normName(r.doctor) === normName(doc));
+            if (!idMatch && !nameMatch) return false;
+        }
+
+        // 3. Hospital filter
+        if (hosp) {
+            const idMatch = r.hospitalId && r.hospitalId === hosp;
+            const nameMatch = (r.hospital && hospName && normName(r.hospital) === normName(hospName)) ||
+                              (r.hospital && normName(r.hospital) === normName(hosp));
+            if (!idMatch && !nameMatch) return false;
+        }
+
+        // 4. Adjustment Type filter
         if (adjType && r.type !== adjType) return false;
+
+        // 5. Staff filter
         if (staff && r.staff !== staff) return false;
+
+        // 6. Date filters
         if (from && r.date && r.date < from) return false;
         if (to && r.date && r.date > to) return false;
+
+        // 7. Patient filter
         if (pat) {
             const idMatch = r.patientId && r.patientId === pat;
             const nameMatch = patName && normName(r.patientName) === patName;
             if (!idMatch && !nameMatch) return false;
         }
+
         return true;
     });
 
@@ -876,21 +1283,29 @@ function applyFilters() {
 }
 
 function resetFilters() {
-    if (typeof selectSSOption === 'function') {
-        selectSSOption('ss-location', '', 'All Locations');
-        selectSSOption('ss-doctor', '', 'All Doctors');
-        selectSSOption('ss-adj-type', '', 'All Types');
-        selectSSOption('ss-patient', '', 'All Patients');
-        selectSSOption('ss-staff', '', 'All Staff');
+    _isUpdatingDropdowns = true;
+    try {
+        if (typeof selectSSOption === 'function') {
+            selectSSOption('ss-practice', '', 'All Practices');
+            populateSSDropdown('ss-doctor', ALL_DOCTOR_ITEMS, 'All Doctors');
+            selectSSOption('ss-doctor', '', 'All Doctors');
+            populateSSDropdown('ss-location', ALL_HOSPITAL_ITEMS, 'All Locations');
+            selectSSOption('ss-location', '', 'All Locations');
+            selectSSOption('ss-adj-type', '', 'All Types');
+            selectSSOption('ss-patient', '', 'All Patients');
+            selectSSOption('ss-staff', '', 'All Staff');
+        }
+
+        const fromEl = document.getElementById('filter-from');
+        const toEl = document.getElementById('filter-to');
+        if (fromEl) fromEl.value = '';
+        if (toEl) toEl.value = '';
+
+        const srchEl = document.getElementById('table-search');
+        if (srchEl) srchEl.value = '';
+    } finally {
+        _isUpdatingDropdowns = false;
     }
-
-    const fromEl = document.getElementById('filter-from');
-    const toEl = document.getElementById('filter-to');
-    if (fromEl) fromEl.value = '';
-    if (toEl) toEl.value = '';
-
-    const srchEl = document.getElementById('table-search');
-    if (srchEl) srchEl.value = '';
 
     filtered = [...allData];
     searchQ = '';
@@ -899,25 +1314,120 @@ function resetFilters() {
     resetTableScroll();
 }
 
+function onPracticeChange(practiceId) {
+    if (_isUpdatingDropdowns) return;
+    _isUpdatingDropdowns = true;
+    try {
+        let docItems = [];
+        let hospItems = [];
+
+        if (practiceId && PRACTICE_TO_DOCTORS.has(practiceId)) {
+            docItems = Array.from(PRACTICE_TO_DOCTORS.get(practiceId).values())
+                .sort((a, b) => a.label.localeCompare(b.label));
+        } else if (practiceId && PRACTICE_NAME_TO_ID.has(normName(practiceId)) && PRACTICE_TO_DOCTORS.has(PRACTICE_NAME_TO_ID.get(normName(practiceId)))) {
+            docItems = Array.from(PRACTICE_TO_DOCTORS.get(PRACTICE_NAME_TO_ID.get(normName(practiceId))).values())
+                .sort((a, b) => a.label.localeCompare(b.label));
+        } else if (!practiceId) {
+            docItems = ALL_DOCTOR_ITEMS;
+        }
+
+        if (practiceId && PRACTICE_TO_HOSPITALS.has(practiceId)) {
+            hospItems = Array.from(PRACTICE_TO_HOSPITALS.get(practiceId).values())
+                .sort((a, b) => a.label.localeCompare(b.label));
+        } else if (practiceId && PRACTICE_NAME_TO_ID.has(normName(practiceId)) && PRACTICE_TO_HOSPITALS.has(PRACTICE_NAME_TO_ID.get(normName(practiceId)))) {
+            hospItems = Array.from(PRACTICE_TO_HOSPITALS.get(PRACTICE_NAME_TO_ID.get(normName(practiceId))).values())
+                .sort((a, b) => a.label.localeCompare(b.label));
+        } else if (!practiceId) {
+            hospItems = ALL_HOSPITAL_ITEMS;
+        }
+
+        populateSSDropdown('ss-doctor', docItems, 'All Doctors');
+        populateSSDropdown('ss-location', hospItems, 'All Locations');
+
+        if (typeof selectSSOption === 'function') {
+            selectSSOption('ss-doctor', '', 'All Doctors');
+            selectSSOption('ss-location', '', 'All Locations');
+        }
+    } finally {
+        _isUpdatingDropdowns = false;
+    }
+
+    applyFilters();
+}
+
+function onDoctorChange(doctorId) {
+    if (_isUpdatingDropdowns) return;
+    _isUpdatingDropdowns = true;
+    try {
+        const practiceEl = document.getElementById('f-practice');
+        const practiceId = practiceEl ? practiceEl.value : '';
+        let hospItems = [];
+
+        if (practiceId) {
+            if (doctorId) {
+                const pdKey = `${practiceId}_${doctorId}`;
+                const docName = DOCTOR_ID_TO_NAME.get(doctorId);
+                const pdNameKey = docName ? `${practiceId}_${normName(docName)}` : '';
+
+                if (PRACTICE_DOC_TO_HOSPITALS.has(pdKey)) {
+                    hospItems = Array.from(PRACTICE_DOC_TO_HOSPITALS.get(pdKey).values());
+                } else if (pdNameKey && PRACTICE_DOC_TO_HOSPITALS.has(pdNameKey)) {
+                    hospItems = Array.from(PRACTICE_DOC_TO_HOSPITALS.get(pdNameKey).values());
+                } else if (PRACTICE_TO_HOSPITALS.has(practiceId)) {
+                    hospItems = Array.from(PRACTICE_TO_HOSPITALS.get(practiceId).values());
+                }
+            } else {
+                if (PRACTICE_TO_HOSPITALS.has(practiceId)) {
+                    hospItems = Array.from(PRACTICE_TO_HOSPITALS.get(practiceId).values());
+                }
+            }
+        } else {
+            if (doctorId) {
+                const docName = DOCTOR_ID_TO_NAME.get(doctorId);
+                if (DOCTOR_TO_HOSPITALS.has(doctorId)) {
+                    hospItems = Array.from(DOCTOR_TO_HOSPITALS.get(doctorId).values());
+                } else if (docName && DOCTOR_TO_HOSPITALS.has(normName(docName))) {
+                    hospItems = Array.from(DOCTOR_TO_HOSPITALS.get(normName(docName)).values());
+                } else if (DOCTOR_HOSPITAL_MAP.has(doctorId)) {
+                    const hIds = DOCTOR_HOSPITAL_MAP.get(doctorId);
+                    hospItems = ALL_HOSPITAL_ITEMS.filter(h => hIds.has(h.value));
+                }
+            } else {
+                hospItems = ALL_HOSPITAL_ITEMS;
+            }
+        }
+
+        hospItems.sort((a, b) => a.label.localeCompare(b.label));
+        populateSSDropdown('ss-location', hospItems, 'All Locations');
+
+        if (typeof selectSSOption === 'function') {
+            selectSSOption('ss-location', '', 'All Locations');
+        }
+    } finally {
+        _isUpdatingDropdowns = false;
+    }
+
+    applyFilters();
+}
+
+function onHospitalChange(hospId) {
+    if (_isUpdatingDropdowns) return;
+    applyFilters();
+}
+
 function filterHospitalsByDoctor(doctorId) {
-    let items;
-    if (!doctorId) {
-        items = ALL_HOSPITAL_ITEMS;
-    } else {
-        const hospIds = DOCTOR_HOSPITAL_MAP.get(doctorId);
-        items = hospIds ? ALL_HOSPITAL_ITEMS.filter(h => hospIds.has(h.value)) : [];
-    }
-    populateSSDropdown('ss-location', items, 'All Locations');
-    if (typeof selectSSOption === 'function') {
-        selectSSOption('ss-location', '', 'All Locations');
-    }
+    onDoctorChange(doctorId);
 }
 
 if (typeof selectSSOption === 'function') {
     const _origSelectSSOption = selectSSOption;
     window.selectSSOption = function (id, value, label) {
         _origSelectSSOption(id, value, label);
-        if (id === 'ss-doctor') filterHospitalsByDoctor(value);
+        if (!_isUpdatingDropdowns) {
+            if (id === 'ss-practice') onPracticeChange(value);
+            else if (id === 'ss-doctor') onDoctorChange(value);
+            else if (id === 'ss-location') onHospitalChange(value);
+        }
     };
 }
 
@@ -1909,11 +2419,13 @@ function iconGlobe(doc, cx, cy, s, color) {
 }
 
 function getReportMeta() {
+    const practiceLabelEl = document.querySelector('#ss-practice .ss-label');
     const docLabelEl = document.querySelector('#ss-doctor .ss-label');
     const hospLabelEl = document.querySelector('#ss-location .ss-label');
     const fromEl = document.getElementById('filter-from');
     const toEl = document.getElementById('filter-to');
 
+    const practiceName = (practiceLabelEl && practiceLabelEl.textContent.trim()) || 'All Practices';
     const doctorName = (docLabelEl && docLabelEl.textContent.trim()) || 'All Doctors';
     const hospitalName = (hospLabelEl && hospLabelEl.textContent.trim()) || 'All Locations';
 
@@ -1948,7 +2460,7 @@ function getReportMeta() {
     const mm = String(now.getMinutes()).padStart(2, '0');
     const generatedOn = `${now.getDate()} ${MONTHS[now.getMonth()]} ${now.getFullYear()} at ${hh}:${mm} ${ampm}`;
 
-    return { doctorName, hospitalName, period, generatedOn };
+    return { practiceName, doctorName, hospitalName, period, generatedOn };
 }
 
 

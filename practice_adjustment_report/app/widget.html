@@ -29,6 +29,26 @@
 <div class="filter-panel">
   <div class="filter-row">
 
+
+ 
+    <div class="filter-group">
+      <label>Practice</label>
+      <div class="searchable-select" id="ss-practice">
+        <div class="ss-trigger" tabindex="0" onclick="toggleSS('ss-practice')" onkeydown="ssTriggerKey(event,'ss-practice')">
+          <span class="ss-label">All Practices</span>
+          <span class="ss-arrow">&#9660;</span>
+        </div>
+        <div class="ss-dropdown">
+          <div class="ss-search-wrap"><input type="text" class="ss-search" placeholder="Search practices…" oninput="filterSS('ss-practice',this.value)" onclick="event.stopPropagation()"></div>
+          <div class="ss-list">
+            <div class="ss-option selected" data-value="">All Practices</div>
+          </div>
+        </div>
+        <input type="hidden" id="f-practice" value="">
+      </div>
+    </div>
+
+
      <div class="filter-group">
       <label>Doctor</label>
       <div class="searchable-select" id="ss-doctor">
@@ -121,6 +141,7 @@
       <label>To Date</label>
       <input type="date" id="filter-to" onclick="this.showPicker()">
     </div>
+
 
   </div>
 
