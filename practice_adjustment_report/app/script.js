@@ -1297,44 +1297,26 @@ function applyFilters() {
                 matchesPractice = true;
             }
 
-            if (!matchesPractice) {
-                const practicePairs = (pId && PRACTICE_DOC_HOSP_PAIRS.get(String(pId))) ||
-                                      (pName && PRACTICE_DOC_HOSP_PAIRS.get(normName(pName)));
-                const practiceDocMap = (pId && PRACTICE_TO_DOCTORS.get(String(pId))) ||
-                                       (pName && PRACTICE_TO_DOCTORS.get(normName(pName)));
-                const practiceHospMap = (pId && PRACTICE_TO_HOSPITALS.get(String(pId))) ||
-                                        (pName && PRACTICE_TO_HOSPITALS.get(normName(pName)));
+            if (!matchesPractice && ALL_SUBFORM_ROWS && ALL_SUBFORM_ROWS.length) {
+                matchesPractice = ALL_SUBFORM_ROWS.some(s => {
+                    const pMatch = (pId && s.practiceId && String(s.practiceId) === String(pId)) ||
+                                   (pName && s.practiceName && isNameMatch(pName, s.practiceName));
+                    if (!pMatch) return false;
 
-                const dId = r.doctorId ? String(r.doctorId) : '';
-                const hId = r.hospitalId ? String(r.hospitalId) : '';
-                const dName = r.doctor ? r.doctor : '';
-                const hName = r.hospital ? r.hospital : '';
+                    const docMatch = (r.doctorId && s.doctorId && String(r.doctorId) === String(s.doctorId)) ||
+                                     (r.doctor && s.doctorName && isNameMatch(r.doctor, s.doctorName));
+                    const hospMatch = (r.hospitalId && s.hospitalId && String(r.hospitalId) === String(s.hospitalId)) ||
+                                      (r.hospital && s.hospitalName && isNameMatch(r.hospital, s.hospitalName));
 
-                if (practicePairs) {
-                    if (dId && hId && practicePairs.has(`${dId}|${hId}`)) matchesPractice = true;
-                    else if (dName && hName && practicePairs.has(`${normName(dName)}|${normName(hName)}`)) matchesPractice = true;
-                    else if (dId && hName && practicePairs.has(`${dId}|${normName(hName)}`)) matchesPractice = true;
-                    else if (dName && hId && practicePairs.has(`${normName(dName)}|${hId}`)) matchesPractice = true;
-                }
-
-                if (!matchesPractice && practiceDocMap && practiceHospMap) {
-                    const docInPractice = (dId && practiceDocMap.has(dId)) ||
-                        (dName && Array.from(practiceDocMap.values()).some(di => isNameMatch(di.label, dName)));
-                    const hospInPractice = (hId && practiceHospMap.has(hId)) ||
-                        (hName && Array.from(practiceHospMap.values()).some(hi => isNameMatch(hi.label, hName)));
-
-                    if (docInPractice && hospInPractice) {
-                        matchesPractice = true;
-                    } else if (docInPractice && (!hName || hName === '—')) {
-                        matchesPractice = true;
-                    } else if (hospInPractice && (!dName || dName === '—')) {
-                        matchesPractice = true;
+                    if (r.doctor && r.doctor !== '—' && r.hospital && r.hospital !== '—') {
+                        return docMatch && hospMatch;
+                    } else if (r.doctor && r.doctor !== '—') {
+                        return docMatch;
+                    } else if (r.hospital && r.hospital !== '—') {
+                        return hospMatch;
                     }
-                } else if (!matchesPractice && practiceDocMap) {
-                    const docInPractice = (dId && practiceDocMap.has(dId)) ||
-                        (dName && Array.from(practiceDocMap.values()).some(di => isNameMatch(di.label, dName)));
-                    if (docInPractice) matchesPractice = true;
-                }
+                    return false;
+                });
             }
 
             if (!matchesPractice) return false;
@@ -1378,6 +1360,41 @@ function applyFilters() {
         return true;
     });
 
+    currentPage = 1;
+    renderTable();
+    resetTableScroll();
+}
+
+
+function resetFilters() {
+    _isUpdatingDropdowns = true;
+    try {
+        if (typeof selectSSOption === 'function') {
+            selectSSOption('ss-practice', '', 'All Practices');
+            if (typeof populateSSDropdown === 'function') {
+                populateSSDropdown('ss-doctor', ALL_DOCTOR_ITEMS, 'All Doctors');
+                populateSSDropdown('ss-location', ALL_HOSPITAL_ITEMS, 'All Locations');
+            }
+            selectSSOption('ss-doctor', '', 'All Doctors');
+            selectSSOption('ss-location', '', 'All Locations');
+            selectSSOption('ss-adj-type', '', 'All Types');
+            selectSSOption('ss-patient', '', 'All Patients');
+            selectSSOption('ss-staff', '', 'All Staff');
+        }
+
+        const fromEl = document.getElementById('filter-from');
+        const toEl = document.getElementById('filter-to');
+        if (fromEl) fromEl.value = '';
+        if (toEl) toEl.value = '';
+
+        const srchEl = document.getElementById('table-search');
+        if (srchEl) srchEl.value = '';
+    } finally {
+        _isUpdatingDropdowns = false;
+    }
+
+    filtered = [...allData];
+    searchQ = '';
     currentPage = 1;
     renderTable();
     resetTableScroll();
