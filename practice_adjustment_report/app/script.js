@@ -314,12 +314,28 @@ async function initWidget() {
         allData = allRows.filter(r => r.type && r.type !== '—');
         filtered = [...allData];
 
-        if (ALL_DOCTOR_ITEMS.length === 0) {
-            populateDoctorDropdownFromClaims(allRows);
-        }
-        const ssList = document.querySelectorAll('#ss-location .ss-list .ss-option');
-        if (ALL_HOSPITAL_ITEMS.length === 0 || ssList.length <= 1) {
-            populateHospitalDropdown(allRows);
+        // Doctor & Hospital dropdown items come from Doctor_Hospital_Subform_Report
+        // Claims doctor & hospital IDs/names mapped for table matching
+        allRows.forEach(r => {
+            if (r.doctor && r.doctor !== '—' && r.doctorId) {
+                if (!DOCTOR_ID_TO_NAME.has(String(r.doctorId))) {
+                    DOCTOR_ID_TO_NAME.set(String(r.doctorId), r.doctor);
+                    DOCTOR_NAME_TO_ID.set(normName(r.doctor), String(r.doctorId));
+                }
+            }
+            if (r.hospital && r.hospital !== '—' && r.hospitalId) {
+                if (!HOSPITAL_ID_TO_NAME.has(String(r.hospitalId))) {
+                    HOSPITAL_ID_TO_NAME.set(String(r.hospitalId), r.hospital);
+                    HOSPITAL_NAME_TO_ID.set(normName(r.hospital), String(r.hospitalId));
+                }
+            }
+        });
+
+        // Ensure dropdowns are populated with Doctor_Hospital_Subform_Report items
+        const curPractice = document.getElementById('f-practice')?.value;
+        if (!curPractice) {
+            populateSSDropdown('ss-doctor', ALL_DOCTOR_ITEMS, 'All Doctors');
+            populateSSDropdown('ss-location', ALL_HOSPITAL_ITEMS, 'All Locations');
         }
 
         populateStaffDropdown(allRows);
@@ -648,6 +664,28 @@ function normName(s) {
     return String(s || '').replace(/\s+/g, ' ').trim().toLowerCase();
 }
 
+function cleanPerson(s) {
+    return String(s || '').toLowerCase()
+        .replace(/^dr\.?\s+|^prof\.?\s+|^mr\.?\s+|^ms\.?\s+|^mrs\.?\s+/i, '')
+        .replace(/[^a-z0-9]/g, '');
+}
+
+function isNameMatch(a, b) {
+    if (!a || !b) return false;
+    const na = normName(a);
+    const nb = normName(b);
+    if (na === nb) return true;
+    const ca = na.replace(/[^a-z0-9]/g, '');
+    const cb = nb.replace(/[^a-z0-9]/g, '');
+    if (ca === cb && ca.length > 0) return true;
+    const pa = cleanPerson(a);
+    const pb = cleanPerson(b);
+    if (pa && pb && pa === pb) return true;
+    if (ca && cb && (ca.includes(cb) || cb.includes(ca))) return true;
+    return false;
+}
+
+
 function populatePatientDropdownDirect(patients) {
     PATIENT_ID_TO_NAME = new Map();
     const items = [];
@@ -724,6 +762,10 @@ function extractLookupName(val, candidates = []) {
         return /^\d{10,}$/.test(val) ? '' : val;
     }
     if (typeof val === 'object') {
+        if (val.display_value && typeof val.display_value === 'string' && val.display_value.trim() !== '[object Object]') {
+            const trimmed = val.display_value.replace(/\s+/g, ' ').trim();
+            if (trimmed) return trimmed;
+        }
         if (val.zc_display_value && val.zc_display_value.trim() !== '[object Object]') {
             const trimmed = val.zc_display_value.replace(/\s+/g, ' ').trim();
             if (trimmed) return trimmed;
@@ -1196,61 +1238,92 @@ function applyFilters() {
     const from = fromEl ? parseZohoDate(fromEl.value) || fromEl.value : '';
     const to = toEl ? parseZohoDate(toEl.value) || toEl.value : '';
 
-    const practiceName = practice ? (PRACTICE_ID_TO_NAME.get(practice) || '') : '';
-    const practicePairs = practice ? PRACTICE_DOC_HOSP_PAIRS.get(practice) : null;
-    const practiceDocMap = practice ? PRACTICE_TO_DOCTORS.get(practice) : null;
-    const practiceHospMap = practice ? PRACTICE_TO_HOSPITALS.get(practice) : null;
+    const docLabelEl = document.querySelector('#ss-doctor .ss-label');
+    const docLabel = (docLabelEl && docLabelEl.textContent.trim() !== 'All Doctors') ? docLabelEl.textContent.trim() : '';
+    const activeDoc = doc || docLabel;
+    const activeDocName = (doc && DOCTOR_ID_TO_NAME.get(String(doc))) || docLabel;
 
-    const docName = doc ? (DOCTOR_ID_TO_NAME.get(doc) || '') : '';
-    const hospName = hosp ? (HOSPITAL_ID_TO_NAME.get(hosp) || '') : '';
+    const hospLabelEl = document.querySelector('#ss-location .ss-label');
+    const hospLabel = (hospLabelEl && hospLabelEl.textContent.trim() !== 'All Locations') ? hospLabelEl.textContent.trim() : '';
+    const activeHosp = hosp || hospLabel;
+    const activeHospName = (hosp && HOSPITAL_ID_TO_NAME.get(String(hosp))) || hospLabel;
+
+    const practiceLabelEl = document.querySelector('#ss-practice .ss-label');
+    const practiceLabel = (practiceLabelEl && practiceLabelEl.textContent.trim() !== 'All Practices') ? practiceLabelEl.textContent.trim() : '';
+    const activePractice = practice || practiceLabel;
+    const activePracticeName = (practice && PRACTICE_ID_TO_NAME.get(String(practice))) || practiceLabel;
 
     filtered = allData.filter(r => {
-        // 1. Practice filter
-        if (practice) {
+        // 1. Practice filter (filters table data based on Doctor and Hospital mapped to that Practice in Doctor_Hospital_Subform_Report)
+        if (activePractice) {
             let matchesPractice = false;
-            if (r.practiceId && (r.practiceId === practice || normName(r.practiceId) === normName(practiceName))) {
-                matchesPractice = true;
-            } else if (r.practiceName && (normName(r.practiceName) === normName(practiceName) || r.practiceName === practice)) {
-                matchesPractice = true;
-            } else if (practicePairs) {
-                const dId = r.doctorId || '';
-                const hId = r.hospitalId || '';
-                const dName = normName(r.doctor);
-                const hName = normName(r.hospital);
+            const pId = practice || '';
+            const pName = activePracticeName || '';
 
-                if (dId && hId && practicePairs.has(`${dId}|${hId}`)) {
-                    matchesPractice = true;
-                } else if (dName && hName && practicePairs.has(`${dName}|${hName}`)) {
-                    matchesPractice = true;
-                } else if (dId && hName && practicePairs.has(`${dId}|${hName}`)) {
-                    matchesPractice = true;
-                } else if (dName && hId && practicePairs.has(`${dName}|${hId}`)) {
-                    matchesPractice = true;
-                } else if (practiceDocMap && (practiceDocMap.has(dId) || (dName && Array.from(practiceDocMap.values()).some(di => normName(di.label) === dName)))
-                       && practiceHospMap && (practiceHospMap.has(hId) || (hName && Array.from(practiceHospMap.values()).some(hi => normName(hi.label) === hName)))) {
-                    matchesPractice = true;
-                } else if ((!hId || r.hospital === '—') && practiceDocMap && (practiceDocMap.has(dId) || (dName && Array.from(practiceDocMap.values()).some(di => normName(di.label) === dName)))) {
-                    matchesPractice = true;
-                } else if ((!dId || r.doctor === '—') && practiceHospMap && (practiceHospMap.has(hId) || (hName && Array.from(practiceHospMap.values()).some(hi => normName(hi.label) === hName)))) {
-                    matchesPractice = true;
+            if (pId && r.practiceId && String(r.practiceId) === String(pId)) {
+                matchesPractice = true;
+            } else if (pName && r.practiceName && isNameMatch(r.practiceName, pName)) {
+                matchesPractice = true;
+            }
+
+            if (!matchesPractice) {
+                const practicePairs = (pId && PRACTICE_DOC_HOSP_PAIRS.get(String(pId))) ||
+                                      (pName && PRACTICE_DOC_HOSP_PAIRS.get(normName(pName)));
+                const practiceDocMap = (pId && PRACTICE_TO_DOCTORS.get(String(pId))) ||
+                                       (pName && PRACTICE_TO_DOCTORS.get(normName(pName)));
+                const practiceHospMap = (pId && PRACTICE_TO_HOSPITALS.get(String(pId))) ||
+                                        (pName && PRACTICE_TO_HOSPITALS.get(normName(pName)));
+
+                const dId = r.doctorId ? String(r.doctorId) : '';
+                const hId = r.hospitalId ? String(r.hospitalId) : '';
+                const dName = r.doctor ? r.doctor : '';
+                const hName = r.hospital ? r.hospital : '';
+
+                if (practicePairs) {
+                    if (dId && hId && practicePairs.has(`${dId}|${hId}`)) matchesPractice = true;
+                    else if (dName && hName && practicePairs.has(`${normName(dName)}|${normName(hName)}`)) matchesPractice = true;
+                    else if (dId && hName && practicePairs.has(`${dId}|${normName(hName)}`)) matchesPractice = true;
+                    else if (dName && hId && practicePairs.has(`${normName(dName)}|${hId}`)) matchesPractice = true;
+                }
+
+                if (!matchesPractice && practiceDocMap && practiceHospMap) {
+                    const docInPractice = (dId && practiceDocMap.has(dId)) ||
+                        (dName && Array.from(practiceDocMap.values()).some(di => isNameMatch(di.label, dName)));
+                    const hospInPractice = (hId && practiceHospMap.has(hId)) ||
+                        (hName && Array.from(practiceHospMap.values()).some(hi => isNameMatch(hi.label, hName)));
+
+                    if (docInPractice && hospInPractice) {
+                        matchesPractice = true;
+                    } else if (docInPractice && (!hName || hName === '—')) {
+                        matchesPractice = true;
+                    } else if (hospInPractice && (!dName || dName === '—')) {
+                        matchesPractice = true;
+                    }
+                } else if (!matchesPractice && practiceDocMap) {
+                    const docInPractice = (dId && practiceDocMap.has(dId)) ||
+                        (dName && Array.from(practiceDocMap.values()).some(di => isNameMatch(di.label, dName)));
+                    if (docInPractice) matchesPractice = true;
                 }
             }
+
             if (!matchesPractice) return false;
         }
 
-        // 2. Doctor filter
-        if (doc) {
-            const idMatch = r.doctorId && r.doctorId === doc;
-            const nameMatch = (r.doctor && docName && normName(r.doctor) === normName(docName)) ||
-                              (r.doctor && normName(r.doctor) === normName(doc));
+        // 2. Doctor filter (applies normally and with practice)
+        if (activeDoc) {
+            const idMatch = (doc && r.doctorId && String(r.doctorId) === String(doc)) ||
+                            (r.doctorId && String(r.doctorId) === String(activeDoc));
+            const nameMatch = (r.doctor && activeDocName && isNameMatch(r.doctor, activeDocName)) ||
+                              (r.doctor && isNameMatch(r.doctor, activeDoc));
             if (!idMatch && !nameMatch) return false;
         }
 
-        // 3. Hospital filter
-        if (hosp) {
-            const idMatch = r.hospitalId && r.hospitalId === hosp;
-            const nameMatch = (r.hospital && hospName && normName(r.hospital) === normName(hospName)) ||
-                              (r.hospital && normName(r.hospital) === normName(hosp));
+        // 3. Hospital filter (applies normally and with practice)
+        if (activeHosp) {
+            const idMatch = (hosp && r.hospitalId && String(r.hospitalId) === String(hosp)) ||
+                            (r.hospitalId && String(r.hospitalId) === String(activeHosp));
+            const nameMatch = (r.hospital && activeHospName && isNameMatch(r.hospital, activeHospName)) ||
+                              (r.hospital && isNameMatch(r.hospital, activeHosp));
             if (!idMatch && !nameMatch) return false;
         }
 
@@ -1274,41 +1347,6 @@ function applyFilters() {
         return true;
     });
 
-    searchQ = '';
-    const srchEl = document.getElementById('table-search');
-    if (srchEl) srchEl.value = '';
-    currentPage = 1;
-    renderTable();
-    resetTableScroll();
-}
-
-function resetFilters() {
-    _isUpdatingDropdowns = true;
-    try {
-        if (typeof selectSSOption === 'function') {
-            selectSSOption('ss-practice', '', 'All Practices');
-            populateSSDropdown('ss-doctor', ALL_DOCTOR_ITEMS, 'All Doctors');
-            selectSSOption('ss-doctor', '', 'All Doctors');
-            populateSSDropdown('ss-location', ALL_HOSPITAL_ITEMS, 'All Locations');
-            selectSSOption('ss-location', '', 'All Locations');
-            selectSSOption('ss-adj-type', '', 'All Types');
-            selectSSOption('ss-patient', '', 'All Patients');
-            selectSSOption('ss-staff', '', 'All Staff');
-        }
-
-        const fromEl = document.getElementById('filter-from');
-        const toEl = document.getElementById('filter-to');
-        if (fromEl) fromEl.value = '';
-        if (toEl) toEl.value = '';
-
-        const srchEl = document.getElementById('table-search');
-        if (srchEl) srchEl.value = '';
-    } finally {
-        _isUpdatingDropdowns = false;
-    }
-
-    filtered = [...allData];
-    searchQ = '';
     currentPage = 1;
     renderTable();
     resetTableScroll();
@@ -1392,6 +1430,9 @@ function onDoctorChange(doctorId) {
                     const hIds = DOCTOR_HOSPITAL_MAP.get(doctorId);
                     hospItems = ALL_HOSPITAL_ITEMS.filter(h => hIds.has(h.value));
                 }
+                if (!hospItems || hospItems.length === 0) {
+                    hospItems = ALL_HOSPITAL_ITEMS;
+                }
             } else {
                 hospItems = ALL_HOSPITAL_ITEMS;
             }
@@ -1419,6 +1460,14 @@ function filterHospitalsByDoctor(doctorId) {
     onDoctorChange(doctorId);
 }
 
+// Global hook called directly by selectSSOption in widget.html
+window.onSSOptionSelected = function (id, value, label) {
+    if (_isUpdatingDropdowns) return;
+    if (id === 'ss-practice') onPracticeChange(value);
+    else if (id === 'ss-doctor') onDoctorChange(value);
+    else if (id === 'ss-location') onHospitalChange(value);
+};
+
 if (typeof selectSSOption === 'function') {
     const _origSelectSSOption = selectSSOption;
     window.selectSSOption = function (id, value, label) {
@@ -1431,9 +1480,6 @@ if (typeof selectSSOption === 'function') {
     };
 }
 
-/* ─────────────────────────────────────────────────────────────────────
-   SEARCH / SORT
-   ───────────────────────────────────────────────────────────────────── */
 function searchTable(q) {
     searchQ = q.toLowerCase();
     currentPage = 1;

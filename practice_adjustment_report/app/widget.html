@@ -293,10 +293,17 @@ function filterSS(id, q) {
 
 function selectSSOption(id, value, label) {
   const el = document.getElementById(id);
-  el.querySelector('.ss-label').textContent = label;
-  el.querySelector('input[type=hidden]').value = value;
+  if (!el) return;
+  const labelEl = el.querySelector('.ss-label');
+  if (labelEl) labelEl.textContent = label;
+  const hiddenInput = el.querySelector('input[type=hidden]');
+  if (hiddenInput) hiddenInput.value = value;
   el.querySelectorAll('.ss-option').forEach(o => o.classList.toggle('selected', o.dataset.value === value));
   closeAllSS();
+
+  if (typeof window.onSSOptionSelected === 'function') {
+    window.onSSOptionSelected(id, value, label);
+  }
 }
 
 /* Populate a searchable-select from an array of {value, label} objects */
