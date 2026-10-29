@@ -311,7 +311,8 @@ async function initWidget() {
         buildAdjOptions();
 
         const allRows = buildClaimsData(claims);
-        allData = allRows.filter(r => r.type && r.type !== '—');
+        // Table data only shows records where doctor matches with hospital configured in Doctor_Hospital_Subform_Report
+        allData = allRows.filter(r => r.type && r.type !== '—' && matchesSubformDoctorHospital(r));
         filtered = [...allData];
 
         // Doctor & Hospital dropdown items come from Doctor_Hospital_Subform_Report
@@ -662,6 +663,36 @@ function populateStaffDropdown(rows) {
 
 function normName(s) {
     return String(s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+function cleanHospital(s) {
+    return String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+function matchesSubformDoctorHospital(r) {
+    if (!ALL_SUBFORM_ROWS || !ALL_SUBFORM_ROWS.length) return true;
+
+    const dId = r.doctorId ? String(r.doctorId) : '';
+    const hId = r.hospitalId ? String(r.hospitalId) : '';
+    const dName = r.doctor && r.doctor !== '—' ? r.doctor : '';
+    const hName = r.hospital && r.hospital !== '—' ? r.hospital : '';
+
+    for (const s of ALL_SUBFORM_ROWS) {
+        const docMatch = (dId && s.doctorId && dId === s.doctorId) ||
+                         (dName && s.doctorName && isNameMatch(dName, s.doctorName));
+        const hospMatch = (hId && s.hospitalId && hId === s.hospitalId) ||
+                          (hName && s.hospitalName && isNameMatch(hName, s.hospitalName));
+
+        if (dName && hName) {
+            if (docMatch && hospMatch) return true;
+        } else if (dName && !hName) {
+            if (docMatch) return true;
+        } else if (!dName && hName) {
+            if (hospMatch) return true;
+        }
+    }
+
+    return false;
 }
 
 function cleanPerson(s) {
