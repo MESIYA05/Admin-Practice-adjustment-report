@@ -250,18 +250,27 @@ async function initWidget() {
         CURRENT_USER_EMAIL = String(CURRENT_USER_EMAIL || "").trim().toLowerCase();
         console.log('[initWidget] Current logged-in user email:', CURRENT_USER_EMAIL);
 
-        // 1d. Identify practice strictly based on Contact_Email == loginuserid
+        // 1d. Identify practice strictly based on My_Practice / Contact_Email == loginuserid
         let matchedPractice = null;
-        const allPracticeCandidates = [...myPractices, ...practices];
 
-        if (CURRENT_USER_EMAIL) {
-            matchedPractice = allPracticeCandidates.find(p => {
+        // Priority 1: My_Practice report is pre-filtered by Zoho Creator with [Contact_Email == zoho.loginuserid]
+        if (myPractices && myPractices.length > 0) {
+            if (CURRENT_USER_EMAIL) {
+                matchedPractice = myPractices.find(p => {
+                    const em = (p.Contact_Email || p.Email || p.contact_email || p.Contact_Email_Address || '').trim().toLowerCase();
+                    return em && em === CURRENT_USER_EMAIL;
+                }) || myPractices[0];
+            } else {
+                matchedPractice = myPractices[0];
+            }
+        }
+
+        // Priority 2: Match against Add_Practice_Report by Contact_Email == CURRENT_USER_EMAIL
+        if (!matchedPractice && CURRENT_USER_EMAIL && practices && practices.length > 0) {
+            matchedPractice = practices.find(p => {
                 const em = (p.Contact_Email || p.Email || p.contact_email || p.Contact_Email_Address || '').trim().toLowerCase();
                 return em && em === CURRENT_USER_EMAIL;
             });
-        } else if (myPractices && myPractices.length > 0) {
-            // My_Practice report is pre-filtered by [Contact_Email == zoho.loginuserid]
-            matchedPractice = myPractices[0];
         }
 
         if (matchedPractice) {
@@ -381,12 +390,59 @@ async function initWidget() {
             console.warn('Could not load Items master report — item numbers will show as "—".', e);
         }
 
-        if (LOGGED_IN_PRACTICE) {
+        // Fetch claims data from Practice_Claims report (#Report:Practice_Claims)
+        let claims = [];
+        try {
             const claimsResp = await getRecords({
                 appName: appName,
-                reportName: "Add_Claim_Report"
+                reportName: "Practice_Claims"
             });
-            const claims = (claimsResp && claimsResp.data) || [];
+            claims = (claimsResp && claimsResp.data) || [];
+            console.log('[initWidget] Practice_Claims loaded:', claims.length);
+        } catch (e) {
+            console.warn('Could not load Practice_Claims report:', e);
+        }
+
+        // Fallback to Add_Claim_Report only if Practice_Claims is not found or empty
+        if (!claims || !claims.length) {
+            try {
+                const claimsResp = await getRecords({
+                    appName: appName,
+                    reportName: "Add_Claim_Report"
+                });
+                claims = (claimsResp && claimsResp.data) || [];
+                console.log('[initWidget] Add_Claim_Report fallback loaded:', claims.length);
+            } catch (e) {
+                console.warn('Could not load Add_Claim_Report:', e);
+            }
+        }
+
+        // Priority 3 for practice resolution: If claims loaded from Practice_Claims and practice not yet set
+        if (!LOGGED_IN_PRACTICE && claims && claims.length > 0) {
+            const firstClaim = claims[0];
+            const pVal = probe(firstClaim, 'Practice', ['Add_Practice', 'Practice_Name', 'Practice_ID', 'practice']);
+            const pId = extractLookupId(pVal);
+            const pName = extractLookupName(pVal, ['Practice_Name', 'Name']);
+            if (pId || pName) {
+                const matchedId = pId || (pName && PRACTICE_NAME_TO_ID.get(normName(pName))) || '';
+                const matchedName = pName || (pId && PRACTICE_ID_TO_NAME.get(String(pId))) || '';
+                if (matchedName) {
+                    LOGGED_IN_PRACTICE = {
+                        id: String(matchedId),
+                        name: String(matchedName),
+                        email: CURRENT_USER_EMAIL,
+                        record: null
+                    };
+                    console.log('[initWidget] Practice resolved from Practice_Claims:', LOGGED_IN_PRACTICE);
+                }
+            }
+        }
+
+        if (LOGGED_IN_PRACTICE) {
+            ALL_PRACTICE_ITEMS = [{ value: LOGGED_IN_PRACTICE.id, label: LOGGED_IN_PRACTICE.name }];
+            populateSSDropdown('ss-practice', ALL_PRACTICE_ITEMS, LOGGED_IN_PRACTICE.name);
+            selectSSOption('ss-practice', LOGGED_IN_PRACTICE.id, LOGGED_IN_PRACTICE.name);
+            lockPracticeSelect();
 
             if (ADJ_TYPES.length === 0) {
                 const seen = new Map();
@@ -408,8 +464,8 @@ async function initWidget() {
             buildAdjOptions();
 
             const allRows = buildClaimsData(claims);
-            // Strict filter: only show records belonging to the matched practice
-            allData = allRows.filter(r => r.type && r.type !== '—' && matchesSubformDoctorHospital(r) && claimMatchesPractice(r, LOGGED_IN_PRACTICE.id, LOGGED_IN_PRACTICE.name));
+            // Since data comes from Practice_Claims, every record belongs to this practice
+            allData = allRows.filter(r => r.type && r.type !== '—');
             filtered = [...allData];
 
             allRows.forEach(r => {
@@ -427,20 +483,45 @@ async function initWidget() {
                 }
             });
 
+            // Populate Doctors & Hospitals (combining mapping and actual claims in Practice_Claims)
             const practiceDocs = getPracticeDoctors(LOGGED_IN_PRACTICE.id, LOGGED_IN_PRACTICE.name);
+            const docSet = new Map();
+            practiceDocs.forEach(d => docSet.set(String(d.value), d));
+            allData.forEach(r => {
+                if (r.doctor && r.doctor !== '—') {
+                    const val = r.doctorId ? String(r.doctorId) : r.doctor;
+                    if (!docSet.has(val)) docSet.set(val, { value: val, label: r.doctor });
+                }
+            });
+            const finalDocs = Array.from(docSet.values()).sort((a, b) => a.label.localeCompare(b.label));
+            populateSSDropdown('ss-doctor', finalDocs, 'All Doctors');
+
             const practiceHosps = getPracticeHospitals(LOGGED_IN_PRACTICE.id, LOGGED_IN_PRACTICE.name);
-            populateSSDropdown('ss-doctor', practiceDocs, 'All Doctors');
-            populateSSDropdown('ss-location', practiceHosps, 'All Locations');
+            const hospSet = new Map();
+            practiceHosps.forEach(h => hospSet.set(String(h.value), h));
+            allData.forEach(r => {
+                if (r.hospital && r.hospital !== '—') {
+                    const val = r.hospitalId ? String(r.hospitalId) : r.hospital;
+                    if (!hospSet.has(val)) hospSet.set(val, { value: val, label: r.hospital });
+                }
+            });
+            const finalHosps = Array.from(hospSet.values()).sort((a, b) => a.label.localeCompare(b.label));
+            populateSSDropdown('ss-location', finalHosps, 'All Locations');
 
             populateStaffDropdown(allData);
             populatePatientDropdownFromClaims(allData);
         } else {
-            // If Contact_Email != loginuserid -> DO NOT SHOW ANY RECORDS
+            // If Contact_Email != loginuserid and no practice linked -> DO NOT SHOW ANY RECORDS
             allData = [];
             filtered = [];
             buildAdjOptions();
             populateStaffDropdown([]);
             populateSSDropdown('ss-patient', [], 'All Patients');
+            populateSSDropdown('ss-practice', [], 'No Practice Linked');
+            selectSSOption('ss-practice', '', 'No Practice Linked');
+            lockPracticeSelect();
+            populateSSDropdown('ss-doctor', [], 'All Doctors');
+            populateSSDropdown('ss-location', [], 'All Locations');
         }
 
         renderTable();
