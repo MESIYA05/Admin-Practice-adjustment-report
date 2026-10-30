@@ -261,6 +261,7 @@
 /* ─── Searchable Select helpers ─── */
 function toggleSS(id) {
   const el = document.getElementById(id);
+  if (!el || el.classList.contains('disabled')) return;
   const isOpen = el.classList.contains('open');
   closeAllSS();
   if (!isOpen) {
@@ -279,6 +280,8 @@ document.addEventListener('click', function(e) {
 });
 
 function ssTriggerKey(e, id) {
+  const el = document.getElementById(id);
+  if (el && el.classList.contains('disabled')) return;
   if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleSS(id); }
   if (e.key === 'Escape') closeAllSS();
 }
