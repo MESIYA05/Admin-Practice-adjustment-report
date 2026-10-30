@@ -136,32 +136,56 @@ async function getRecords(config) {
     let cursor = null;
     let page = 1;
 
+    const reportName = config.reportName || config.report_name;
+    const appName = config.appName || config.app_name || "claims-management";
+
     for (let i = 0; i < MAX_PAGES; i++) {
         const pageConfig = {
-            app_name: config.appName,
-            report_name: config.reportName,
-            max_records: PAGE_SIZE
+            appName: appName,
+            app_name: appName,
+            appLinkName: appName,
+            reportName: reportName,
+            report_name: reportName,
+            max_records: PAGE_SIZE,
+            pageSize: PAGE_SIZE,
+            page: page
         };
         if (config.criteria && config.criteria.trim() !== "") {
             pageConfig.criteria = config.criteria;
         }
         if (cursor) {
             pageConfig.record_cursor = cursor;
-        } else {
-            pageConfig.page = page;
-            pageConfig.pageSize = PAGE_SIZE;
         }
 
-        let resp;
-        if (ZOHO.CREATOR.DATA && typeof ZOHO.CREATOR.DATA.getRecords === "function") {
-            resp = await ZOHO.CREATOR.DATA.getRecords(pageConfig);
-        } else if (ZOHO.CREATOR.API && typeof ZOHO.CREATOR.API.getAllRecords === "function") {
-            resp = await ZOHO.CREATOR.API.getAllRecords(pageConfig);
-        } else {
-            throw new Error("No known getRecords method found on ZOHO.CREATOR.");
+        let resp = null;
+        try {
+            if (ZOHO.CREATOR.API && typeof ZOHO.CREATOR.API.getAllRecords === "function") {
+                resp = await ZOHO.CREATOR.API.getAllRecords(pageConfig);
+            } else if (ZOHO.CREATOR.DATA && typeof ZOHO.CREATOR.DATA.getRecords === "function") {
+                resp = await ZOHO.CREATOR.DATA.getRecords(pageConfig);
+            }
+        } catch (callErr) {
+            console.warn(`[getRecords] call error for ${reportName} (page ${page}):`, callErr);
+            if (page === 1) {
+                try {
+                    const fallbackConfig = {
+                        reportName: reportName,
+                        report_name: reportName,
+                        page: 1,
+                        pageSize: PAGE_SIZE,
+                        max_records: PAGE_SIZE
+                    };
+                    if (config.criteria) fallbackConfig.criteria = config.criteria;
+                    if (ZOHO.CREATOR.API && typeof ZOHO.CREATOR.API.getAllRecords === "function") {
+                        resp = await ZOHO.CREATOR.API.getAllRecords(fallbackConfig);
+                    }
+                } catch (fallbackErr) {
+                    console.warn(`[getRecords] fallback for ${reportName} also failed:`, fallbackErr);
+                }
+            }
         }
 
-        const data = (resp && resp.data) || [];
+        const data = (resp && resp.data) || (Array.isArray(resp) ? resp : []);
         if (!data.length) break;
 
         let added = 0;
@@ -179,7 +203,7 @@ async function getRecords(config) {
         page++;
     }
 
-    console.log(`[getRecords] ${config.reportName}: ${byId.size} records`);
+    console.log(`[getRecords] ${reportName}: ${byId.size} records`);
     return { data: Array.from(byId.values()) };
 }
 
@@ -189,28 +213,59 @@ async function initWidget() {
 
     try {
         let appName = "claims-management";
+
         try {
-            const queryParams = await ZOHO.CREATOR.UTIL.getQueryParams();
-            if (queryParams && (queryParams.appName || queryParams.app_name)) {
-                appName = queryParams.appName || queryParams.app_name;
+            if (typeof ZOHO.CREATOR.init === "function") {
+                const initData = await ZOHO.CREATOR.init();
+                if (initData) {
+                    if (initData.appName || initData.appLinkName) appName = initData.appName || initData.appLinkName;
+                    if (initData.loginUser || initData.loginUserId || initData.user || initData.email) {
+                        CURRENT_USER_EMAIL = initData.loginUser || initData.loginUserId || initData.user || initData.email;
+                    }
+                }
             }
         } catch (e) {
-            await ZOHO.CREATOR.UTIL.getQueryParams();
+            console.log('[initWidget] ZOHO.CREATOR.init notice:', e);
         }
 
-        // 1. Fetch Practices from Add_Practice_Report (Practice_Name)
-        let practices = [];
         try {
-            const practiceResp = await getRecords({
-                appName: appName,
-                reportName: "Add_Practice_Report"
-            });
-            practices = (practiceResp && practiceResp.data) || [];
+            const queryParams = await ZOHO.CREATOR.UTIL.getQueryParams();
+            if (queryParams) {
+                if (queryParams.appName || queryParams.app_name || queryParams.appLinkName) {
+                    appName = queryParams.appName || queryParams.app_name || queryParams.appLinkName;
+                }
+                if (!CURRENT_USER_EMAIL) {
+                    CURRENT_USER_EMAIL = queryParams.loginUser || queryParams.loginUserId || queryParams.user || queryParams.email || "";
+                }
+            }
         } catch (e) {
-            console.warn('Could not load Add_Practice_Report:', e);
+            console.log('[initWidget] getQueryParams notice:', e);
         }
 
-        // 1b. Fetch My_Practice report (scoped to logged-in user: [Contact_Email == zoho.loginuserid])
+        try {
+            const initParams = await ZOHO.CREATOR.UTIL.getInitParams();
+            if (initParams) {
+                if (!appName && (initParams.appName || initParams.appLinkName)) {
+                    appName = initParams.appName || initParams.appLinkName;
+                }
+                if (!CURRENT_USER_EMAIL) {
+                    CURRENT_USER_EMAIL = initParams.loginUser || initParams.loginUserId || initParams.user || initParams.email || initParams.login_user || "";
+                }
+            }
+        } catch (e) {
+            console.log('[initWidget] getInitParams notice:', e);
+        }
+
+        if (!CURRENT_USER_EMAIL) {
+            try {
+                const urlParams = new URLSearchParams(window.location.search);
+                CURRENT_USER_EMAIL = urlParams.get("loginUser") || urlParams.get("user") || urlParams.get("email") || urlParams.get("loginUserId") || "";
+            } catch (e) {}
+        }
+        CURRENT_USER_EMAIL = String(CURRENT_USER_EMAIL || "").trim().toLowerCase();
+        console.log('[initWidget] Current logged-in user email:', CURRENT_USER_EMAIL);
+
+        // 1. Fetch My_Practice report (deluge filtered [Contact_Email == zoho.loginuserid])
         let myPractices = [];
         try {
             const myPracticeResp = await getRecords({
@@ -223,34 +278,20 @@ async function initWidget() {
             console.warn('Could not load My_Practice report:', e);
         }
 
-        // 1c. Get logged-in user email
-        CURRENT_USER_EMAIL = "";
+        // 2. Fetch Practices from Add_Practice_Report
+        let practices = [];
         try {
-            const initParams = await ZOHO.CREATOR.UTIL.getInitParams();
-            if (initParams) {
-                CURRENT_USER_EMAIL = initParams.loginUser || initParams.loginUserId || initParams.user || initParams.email || "";
-            }
+            const practiceResp = await getRecords({
+                appName: appName,
+                reportName: "Add_Practice_Report"
+            });
+            practices = (practiceResp && practiceResp.data) || [];
+            console.log('[initWidget] Add_Practice_Report loaded:', practices.length);
         } catch (e) {
-            console.warn('Could not get initParams:', e);
+            console.warn('Could not load Add_Practice_Report:', e);
         }
-        if (!CURRENT_USER_EMAIL) {
-            try {
-                const queryParams = await ZOHO.CREATOR.UTIL.getQueryParams();
-                if (queryParams) {
-                    CURRENT_USER_EMAIL = queryParams.loginUser || queryParams.loginUserId || queryParams.user || queryParams.email || "";
-                }
-            } catch (e) {}
-        }
-        if (!CURRENT_USER_EMAIL) {
-            try {
-                const urlParams = new URLSearchParams(window.location.search);
-                CURRENT_USER_EMAIL = urlParams.get("loginUser") || urlParams.get("user") || urlParams.get("email") || urlParams.get("loginUserId") || "";
-            } catch (e) {}
-        }
-        CURRENT_USER_EMAIL = String(CURRENT_USER_EMAIL || "").trim().toLowerCase();
-        console.log('[initWidget] Current logged-in user email:', CURRENT_USER_EMAIL);
 
-        // 1d. Identify practice strictly based on My_Practice / Contact_Email == loginuserid
+        // Identify practice strictly based on My_Practice / Contact_Email == loginuserid
         let matchedPractice = null;
 
         // Priority 1: My_Practice report is pre-filtered by Zoho Creator with [Contact_Email == zoho.loginuserid]
@@ -258,10 +299,13 @@ async function initWidget() {
             if (CURRENT_USER_EMAIL) {
                 matchedPractice = myPractices.find(p => {
                     const em = (p.Contact_Email || p.Email || p.contact_email || p.Contact_Email_Address || '').trim().toLowerCase();
-                    return em && em === CURRENT_USER_EMAIL;
+                    return em && (em === CURRENT_USER_EMAIL || CURRENT_USER_EMAIL.includes(em) || em.includes(CURRENT_USER_EMAIL));
                 }) || myPractices[0];
             } else {
                 matchedPractice = myPractices[0];
+            }
+            if (!CURRENT_USER_EMAIL && matchedPractice.Contact_Email) {
+                CURRENT_USER_EMAIL = String(matchedPractice.Contact_Email).trim().toLowerCase();
             }
         }
 
@@ -269,7 +313,7 @@ async function initWidget() {
         if (!matchedPractice && CURRENT_USER_EMAIL && practices && practices.length > 0) {
             matchedPractice = practices.find(p => {
                 const em = (p.Contact_Email || p.Email || p.contact_email || p.Contact_Email_Address || '').trim().toLowerCase();
-                return em && em === CURRENT_USER_EMAIL;
+                return em && (em === CURRENT_USER_EMAIL || CURRENT_USER_EMAIL.includes(em) || em.includes(CURRENT_USER_EMAIL));
             });
         }
 
@@ -290,10 +334,10 @@ async function initWidget() {
             }
         } else {
             LOGGED_IN_PRACTICE = null;
-            console.log('[initWidget] User is not linked to any practice (Contact_Email != loginuserid). No records will be displayed.');
+            console.log('[initWidget] User is not linked to any practice. No records will be displayed.');
         }
 
-        // 2. Fetch Doctor & Hospital from Doctor_Hospital_Subform_Report
+        // 3. Fetch Doctor & Hospital from Doctor_Hospital_Subform_Report
         let subformRecs = [];
         try {
             const subformResp = await getRecords({
@@ -305,7 +349,7 @@ async function initWidget() {
             console.warn('Could not load Doctor_Hospital_Subform_Report:', e);
         }
 
-        if (matchedPractice && matchedPractice.Doctor_Hospital_Mapping) {
+        if (matchedPractice && matchedPractice.Doctor_Hospital_Mapping && LOGGED_IN_PRACTICE) {
             const rawMappings = Array.isArray(matchedPractice.Doctor_Hospital_Mapping)
                 ? matchedPractice.Doctor_Hospital_Mapping
                 : [matchedPractice.Doctor_Hospital_Mapping];
@@ -353,26 +397,6 @@ async function initWidget() {
 
         buildPracticeDoctorHospitalMappings(practices, subformRecs, doctorsFallback, hospitalsFallback);
 
-        if (LOGGED_IN_PRACTICE) {
-            ALL_PRACTICE_ITEMS = [{ value: LOGGED_IN_PRACTICE.id, label: LOGGED_IN_PRACTICE.name }];
-            populateSSDropdown('ss-practice', ALL_PRACTICE_ITEMS, LOGGED_IN_PRACTICE.name);
-            selectSSOption('ss-practice', LOGGED_IN_PRACTICE.id, LOGGED_IN_PRACTICE.name);
-            lockPracticeSelect();
-
-            const practiceDocs = getPracticeDoctors(LOGGED_IN_PRACTICE.id, LOGGED_IN_PRACTICE.name);
-            const practiceHosps = getPracticeHospitals(LOGGED_IN_PRACTICE.id, LOGGED_IN_PRACTICE.name);
-            populateSSDropdown('ss-doctor', practiceDocs, 'All Doctors');
-            populateSSDropdown('ss-location', practiceHosps, 'All Locations');
-        } else {
-            ALL_PRACTICE_ITEMS = [];
-            populateSSDropdown('ss-practice', [], 'No Linked Practice');
-            selectSSOption('ss-practice', '', 'No Linked Practice');
-            lockPracticeSelect();
-
-            populateSSDropdown('ss-doctor', [], 'All Doctors');
-            populateSSDropdown('ss-location', [], 'All Locations');
-        }
-
         try {
             const itemsResp = await getRecords({
                 appName: appName,
@@ -387,10 +411,10 @@ async function initWidget() {
                 if (id && num) ITEM_ID_TO_NUMBER_MAP.set(String(id), String(num));
             });
         } catch (e) {
-            console.warn('Could not load Items master report — item numbers will show as "—".', e);
+            console.warn('Could not load Items master report:', e);
         }
 
-        // Fetch claims data from Practice_Claims report (#Report:Practice_Claims)
+        // 4. Fetch claims data from Practice_Claims report (#Report:Practice_Claims)
         let claims = [];
         try {
             const claimsResp = await getRecords({
@@ -414,27 +438,6 @@ async function initWidget() {
                 console.log('[initWidget] Add_Claim_Report fallback loaded:', claims.length);
             } catch (e) {
                 console.warn('Could not load Add_Claim_Report:', e);
-            }
-        }
-
-        // Priority 3 for practice resolution: If claims loaded from Practice_Claims and practice not yet set
-        if (!LOGGED_IN_PRACTICE && claims && claims.length > 0) {
-            const firstClaim = claims[0];
-            const pVal = probe(firstClaim, 'Practice', ['Add_Practice', 'Practice_Name', 'Practice_ID', 'practice']);
-            const pId = extractLookupId(pVal);
-            const pName = extractLookupName(pVal, ['Practice_Name', 'Name']);
-            if (pId || pName) {
-                const matchedId = pId || (pName && PRACTICE_NAME_TO_ID.get(normName(pName))) || '';
-                const matchedName = pName || (pId && PRACTICE_ID_TO_NAME.get(String(pId))) || '';
-                if (matchedName) {
-                    LOGGED_IN_PRACTICE = {
-                        id: String(matchedId),
-                        name: String(matchedName),
-                        email: CURRENT_USER_EMAIL,
-                        record: null
-                    };
-                    console.log('[initWidget] Practice resolved from Practice_Claims:', LOGGED_IN_PRACTICE);
-                }
             }
         }
 
@@ -464,7 +467,6 @@ async function initWidget() {
             buildAdjOptions();
 
             const allRows = buildClaimsData(claims);
-            // Since data comes from Practice_Claims, every record belongs to this practice
             allData = allRows.filter(r => r.type && r.type !== '—');
             filtered = [...allData];
 
@@ -483,7 +485,7 @@ async function initWidget() {
                 }
             });
 
-            // Populate Doctors & Hospitals (combining mapping and actual claims in Practice_Claims)
+            // Populate Doctors & Hospitals for this practice
             const practiceDocs = getPracticeDoctors(LOGGED_IN_PRACTICE.id, LOGGED_IN_PRACTICE.name);
             const docSet = new Map();
             practiceDocs.forEach(d => docSet.set(String(d.value), d));
@@ -511,7 +513,7 @@ async function initWidget() {
             populateStaffDropdown(allData);
             populatePatientDropdownFromClaims(allData);
         } else {
-            // If Contact_Email != loginuserid and no practice linked -> DO NOT SHOW ANY RECORDS
+            // User does not match any practice -> show 0 records
             allData = [];
             filtered = [];
             buildAdjOptions();
@@ -534,10 +536,6 @@ async function initWidget() {
     }
 }
 
-
-/* ─────────────────────────────────────────────────────────────────────
-   DROPDOWN HELPERS & MAPPING BUILDER
-   ───────────────────────────────────────────────────────────────────── */
 function buildPracticeDoctorHospitalMappings(practices, subformRecs, doctorsFallback = [], hospitalsFallback = []) {
     PRACTICE_ID_TO_NAME = new Map();
     PRACTICE_NAME_TO_ID = new Map();
@@ -1523,6 +1521,11 @@ function buildClaimsData(invoices) {
             }
         }
 
+        if (LOGGED_IN_PRACTICE) {
+            if (!pId) pId = LOGGED_IN_PRACTICE.id;
+            if (!pName) pName = LOGGED_IN_PRACTICE.name;
+        }
+
         return {
             id: rec.ID || '',
             claimId: claimIdRaw || rec.ID || '',
@@ -2399,6 +2402,7 @@ const LOGO = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAA4QAAAFNCAYAAABYNqFu
             const contactY = pageH - 7;
 
             const doc = new jsPDF({ orientation: 'landscape', unit: 'mm', format: 'a4' });
+            const logoDataUrl = (typeof LOGO !== 'undefined' && LOGO) || LOGO_DATA_URL;
 
             function drawGradientLine(y, x1, x2, weight) {
                 const mid = x1 + (x2 - x1) * 0.72;
@@ -2741,7 +2745,16 @@ const LOGO = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAA4QAAAFNCAYAAABYNqFu
             }
 
             // Desktop → download; iPhone/Android → preview + share sheet
-            deliverFile(doc.output('blob'), 'Adjustment_Report_' + exportDateStamp() + '.pdf');
+            const fileName = 'Adjustment_Report_' + exportDateStamp() + '.pdf';
+            if (!isMobileDevice()) {
+                try {
+                    doc.save(fileName);
+                } catch (saveErr) {
+                    deliverFile(doc.output('blob'), fileName);
+                }
+            } else {
+                deliverFile(doc.output('blob'), fileName);
+            }
 
             hideLoading();
             showToast(isMobileDevice() ? '✓ PDF ready' : '✓ PDF exported successfully');
